@@ -1,0 +1,95 @@
+# --- Install required libs ---
+!pip install pdfplumber sentence-transformers transformers spacy langchain-community faiss-cpu -q
+import pdfplumber, re, torch
+import pandas as pd
+from sentence_transformers import SentenceTransformer, util
+from transformers import pipeline
+
+# -------- STEP 1: Load and extract PDF text --------
+def extract_text_from_pdf(file_path):
+    text = ""
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text() or ""
+            text += page_text + "\n"
+    return text.strip()
+
+# -------- STEP 2: Split text into paragraphs --------
+def split_into_paragraphs(text):
+    return [p.strip() for p in re.split(r'\n{2,}', text) if p.strip()]
+
+# -------- STEP 3: Clause detection --------
+def detect_clauses(paragraphs):
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    clause_templates = {
+        "Termination": "This clause explains how and when the contract can be terminated.",
+        "Confidentiality": "This clause discusses nondisclosure of information.",
+        "Liability": "This clause outlines responsibilities and liabilities.",
+        "Indemnification": "This clause defines compensation for harm or loss.",
+        "Dispute Resolution": "This clause covers legal methods of resolving disagreements."
+    }
+
+    para_embeddings = model.encode(paragraphs, convert_to_tensor=True)
+    results = {}
+
+    for clause, desc in clause_templates.items():
+        query_emb = model.encode(desc, convert_to_tensor=True)
+        scores = util.cos_sim(query_emb, para_embeddings)[0]
+        best_idx = torch.argmax(scores).item()
+        if scores[best_idx] > 0.5:  # threshold
+            results[clause] = {
+                "text": paragraphs[best_idx],
+                "score": float(scores[best_idx])
+            }
+    return results
+
+# -------- STEP 4: Risk assessment --------
+def assess_clause_risk(text):
+    high = ["indemnify", "liable", "damages", "terminate without cause", "breach"]
+    med = ["subject to", "must", "shall", "limited"]
+
+    score = 0
+    t = text.lower()
+    for w in high:
+        if w in t: score += 2
+    for w in med:
+        if w in t: score += 1
+
+    if score >= 3: return "High"
+    elif score == 2: return "Medium"
+    else: return "Low"
+
+# -------- STEP 5: Named Entity Recognition (parties, dates, money) --------
+def extract_entities(text):
+    ner = pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple")
+    return ner(text)
+
+# -------- STEP 6: Main analyzer --------
+def analyze_legal_doc(file_path):
+    text = extract_text_from_pdf(file_path)
+    paragraphs = split_into_paragraphs(text)
+    clauses = detect_clauses(paragraphs)
+
+    output = []
+    for clause, info in clauses.items():
+        risk = assess_clause_risk(info["text"])
+        output.append({
+            "Clause": clause,
+            "Extract": info["text"],
+            "Risk": risk,
+            "RelevanceScore": round(info["score"], 2)
+        })
+
+    entities = extract_entities(text[:3000])  # truncate long docs for NER
+
+    return pd.DataFrame(output), entities
+
+# -------- RUN EXAMPLE --------
+file_path = "123 coming st lease .pdf"  # replace with your uploaded file name
+clauses_df, entities = analyze_legal_doc(file_path)
+
+print("📌 Key Clauses & Risks:")
+display(clauses_df)
+
+print("\n📌 Named Entities Detected:")
+print(entities)
